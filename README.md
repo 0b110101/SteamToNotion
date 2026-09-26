@@ -27,8 +27,9 @@
 2. **准备密钥**：
    | 密钥项 | 获取途径 |
    | :--- | :--- |
-   | **Notion Integration Token** | 访问 [Notion My Integrations](https://www.notion.so/my-integrations) → 点击「+ New integration」创建，复制 Internal Integration Secret（以 `ntn_` 或 `secret_` 开头）。 |
-   | **SteamGridDB API Key** | 访问 [SteamGridDB Preferences API](https://www.steamgriddb.com/profile/preferences/api) 登录后生成 API Key。 |
+   | **Notion Integration Token** *(必填)* | 访问 [Notion My Integrations](https://www.notion.so/my-integrations) → 点击「+ New integration」创建，复制 Internal Integration Secret（以 `ntn_` 或 `secret_` 开头）。 |
+   | **SteamGridDB API Key** *(必填)* | 访问 [SteamGridDB Preferences API](https://www.steamgriddb.com/profile/preferences/api) 登录后生成 API Key，用于拉取高清画廊封面与横幅。 |
+   | **Steam 64位 ID & Steam API Key** *(选填)* | 访问 [Steam API Key 申请页](https://steamcommunity.com/dev/apikey) 获取。**仅在需要同步「个人游玩总时长」时填写**，其余情况留空即可。<br>⚠️ *说明：受 Steam 官方 API 权限限制，游玩时长仅支持账号自己购买拥有的游戏，**无法获取家庭共享库游玩游戏的时长**。* |
    
    > ⚠️ **重要步骤（Notion 授权）**：  
    > 打开你要同步的 Notion 游戏数据库页面 → 点击右上角 `···` → `Connections (连接)` → 搜索并添加你刚才创建的 Integration。
@@ -36,8 +37,8 @@
    - 双击文件夹中的 `SteamToNotion.exe`；
    - 系统将自动打开默认浏览器访问 `http://127.0.0.1:8000`。
 4. **初始化设置**：
-   - 点击右上角 ⚙️ **设置**，填入你的 Notion Token 与 SteamGridDB Key；
-   - 如处于需要特定代理的网络环境，可在「HTTP 代理」一栏填入（例如 `http://127.0.0.1:7890`），直连或 TUN 模式留空即可；
+   - 点击右上角 ⚙️ **设置**，填入你的 Notion Token 与 SteamGridDB Key（如需统计时长再填 Steam ID 和 Key）；
+   - **网络代理设置**：若使用科学上网工具的**规则模式**，由于本地后端请求通常不走系统代理分流，**一般需要填写**本地监听端口（例如 `http://127.0.0.1:7890`）；若使用 **TUN 虚拟网卡模式**、**游戏加速器**或**直连**，留空即可；
    - 点击「加载数据库列表」选择你的游戏库，系统会自动匹配并对齐字段映射，确认后点击「保存所有设置」。
 5. **开始录入与更新**：
    - 在搜索框中输入游戏名称或 Steam App ID（例如 `1086940` 或 `天国：拯救2`）；
