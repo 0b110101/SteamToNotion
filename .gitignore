@@ -1,0 +1,28 @@
+# Sensitive configuration containing API tokens
+config.json
+
+# Handover and internal notes
+HANDOVER*
+*.log
+
+# Python cache & artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+ENV/
+
+# PyInstaller & build outputs
+build/
+dist/
+*.spec
+
+# IDE & OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

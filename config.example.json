@@ -1,0 +1,72 @@
+{
+  "notion_token": "",
+  "steamgriddb_key": "",
+  "steam_api_key": "",
+  "steam_id64": "",
+  "database_id": "",
+  "proxy": "",
+  "field_mapping": {
+    "title": {
+      "name": "游戏名称",
+      "type": "title",
+      "enabled": true
+    },
+    "title_en": {
+      "name": "全名",
+      "type": "rich_text",
+      "enabled": true
+    },
+    "cover_grid": {
+      "name": "封面",
+      "type": "files",
+      "enabled": true
+    },
+    "cover_hero": {
+      "name": "横幅",
+      "type": "files",
+      "enabled": false
+    },
+    "genre": {
+      "name": "类型",
+      "type": "multi_select",
+      "enabled": true
+    },
+    "tags": {
+      "name": "标签",
+      "type": "multi_select",
+      "enabled": true
+    },
+    "release_date": {
+      "name": "发行日期",
+      "type": "date",
+      "enabled": true
+    },
+    "playtime": {
+      "name": "游玩时长",
+      "type": "rich_text",
+      "enabled": false
+    },
+    "developer": {
+      "name": "开发商",
+      "type": "multi_select",
+      "enabled": true
+    },
+    "publisher": {
+      "name": "发行商",
+      "type": "multi_select",
+      "enabled": true
+    },
+    "description": {
+      "name": "简介",
+      "type": "rich_text",
+      "enabled": false
+    },
+    "steam_url": {
+      "name": "Steam链接",
+      "type": "url",
+      "enabled": false
+    }
+  },
+  "use_hero_as_cover": true,
+  "use_icon_as_page_icon": true
+}

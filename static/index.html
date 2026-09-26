@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Steam → Notion</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <header>
+        <h1>🎮 Steam → Notion</h1>
+        <button id="open-settings-btn" title="Settings">⚙️</button>
+    </header>
+
+    <main>
+        <section id="search-section">
+            <div class="search-wrapper">
+                <input type="text" id="search-input" name="steam_search_query" autocomplete="off" spellcheck="false" placeholder="输入游戏名称、App ID 或 Steam URL">
+                <button id="search-btn">搜索</button>
+                <div id="search-results" class="search-results hidden"></div>
+            </div>
+        </section>
+
+        <div id="main-loading" class="hidden">
+            <div class="spinner"></div>
+            <p>正在获取数据 / Fetching data...</p>
+        </div>
+
+        <section id="game-info-section" class="hidden card">
+            <div id="edit-banner" class="edit-banner hidden">
+                <div class="edit-banner-content">
+                    <span class="edit-banner-icon">⚠️</span>
+                    <div class="edit-banner-text">
+                        <strong>此游戏已存在于 Notion 数据库中</strong>
+                        <p>当前处于编辑模式，表单已填入 Notion 现有数据。修改后点击下方更新保存。</p>
+                    </div>
+                </div>
+                <div class="edit-banner-actions">
+                    <a id="edit-banner-view-link" href="#" target="_blank" class="banner-link">在 Notion 中查看 ↗</a>
+                    <button type="button" id="btn-force-create" class="banner-btn" title="忽略已存在的条目，作为新页面提交">强制新建</button>
+                </div>
+            </div>
+
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem; flex-wrap: wrap; gap: 8px;">
+                <h2 style="margin: 0;">基本信息 (Game Info)</h2>
+                <button type="button" id="btn-reset-to-steam" class="text-btn hidden" style="font-size: 0.85rem; color: var(--accent-blue); background: none; border: none; cursor: pointer; padding: 0;" title="使用从 Steam 获取的原始数据重新覆盖表单">🔄 用 Steam 数据覆盖</button>
+            </div>
+            <div class="form-grid">
+                <div class="form-group">
+                    <label for="game-title">游戏名称 (Title)</label>
+                    <input type="text" id="game-title">
+                </div>
+                <div class="form-group">
+                    <label for="game-title-en">英文全名 (Full Name)</label>
+                    <input type="text" id="game-title-en">
+                </div>
+                <div class="form-group">
+                    <label for="game-developer">开发商 (Developer)</label>
+                    <input type="text" id="game-developer">
+                </div>
+                <div class="form-group">
+                    <label for="game-publisher">发行商 (Publisher)</label>
+                    <input type="text" id="game-publisher">
+                </div>
+                <div class="form-group">
+                    <label for="game-release-date">发行日期 (Release Date)</label>
+                    <input type="date" id="game-release-date">
+                </div>
+                <div class="form-group">
+                    <label for="game-playtime">游玩时长 (小时 / Playtime)</label>
+                    <div style="display: flex; gap: 8px;">
+                        <input type="number" step="0.1" id="game-playtime" placeholder="未查询" style="flex: 1;">
+                        <button type="button" id="refresh-playtime-btn" class="secondary-btn" style="padding: 0 12px;" title="重新获取时长">🔄</button>
+                    </div>
+                </div>
+                <div class="form-group full-width">
+                    <label for="game-steam-url">Steam 链接 (Steam URL)</label>
+                    <input type="url" id="game-steam-url" readonly>
+                </div>
+                <div class="form-group full-width">
+                    <label>类型 (Genres)</label>
+                    <div id="genres-container" class="tags-container"></div>
+                    <input type="text" id="add-genre-input" placeholder="按回车添加 / Enter to add..." class="add-tag-input">
+                </div>
+                <div class="form-group full-width">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem; flex-wrap: wrap; gap: 8px;">
+                        <label style="margin-bottom: 0;">标签 (Tags) <span id="tags-hint" style="font-size: 0.8rem; color: var(--text-secondary); font-weight: normal; margin-left: 6px;">(点击高亮选择，默认前5个)</span></label>
+                        <div class="tags-actions" style="font-size: 0.8rem; display: flex; gap: 8px;">
+                            <button type="button" id="tags-pick-5" class="text-btn" style="color: var(--accent-blue); background: none; border: none; cursor: pointer; padding: 0;">前5个</button>
+                            <span style="color: var(--text-secondary);">|</span>
+                            <button type="button" id="tags-pick-all" class="text-btn" style="color: var(--accent-blue); background: none; border: none; cursor: pointer; padding: 0;">全选</button>
+                            <span style="color: var(--text-secondary);">|</span>
+                            <button type="button" id="tags-clear-all" class="text-btn" style="color: var(--text-secondary); background: none; border: none; cursor: pointer; padding: 0;">清空</button>
+                        </div>
+                    </div>
+                    <div id="tags-container" class="tags-container"></div>
+                    <input type="text" id="add-tag-input" placeholder="按回车添加自定义标签 / Enter to add..." class="add-tag-input">
+                </div>
+                <div class="form-group full-width">
+                    <label for="game-description">简介 (Description)</label>
+                    <textarea id="game-description" rows="4"></textarea>
+                </div>
+                <div class="form-group full-width">
+                    <label>Steam 封面 (Header Image)</label>
+                    <img id="game-header-image" src="" alt="Header" class="header-preview">
+                </div>
+            </div>
+        </section>
+
+        <section id="image-gallery-section" class="hidden card">
+            <h2>图片选择 (Image Gallery)</h2>
+            <div class="tabs">
+                <button class="tab-btn active" data-tab="grids">Grid (封面)</button>
+                <button class="tab-btn" data-tab="heroes">Hero (横幅)</button>
+                <button class="tab-btn" data-tab="icons">Icon (图标)</button>
+            </div>
+            
+            <div id="grid-sub-filter" class="sub-filter-row">
+                <span class="sub-filter-title">封面版式：</span>
+                <button class="sub-filter-btn active" data-orientation="all">全部 (横版优先)</button>
+                <button class="sub-filter-btn" data-orientation="horizontal">横版 (92:43)</button>
+                <button class="sub-filter-btn" data-orientation="vertical">竖版 (600×900)</button>
+            </div>
+            
+            <div class="tab-content">
+                <div id="gallery-grids" class="gallery-grid active"></div>
+                <div id="gallery-heroes" class="gallery-grid"></div>
+                <div id="gallery-icons" class="gallery-grid"></div>
+            </div>
+        </section>
+
+        <section id="submit-section" class="hidden">
+            <!-- 新建模式按钮组 -->
+            <div id="create-btn-group">
+                <button id="submit-btn">📤 提交到 Notion</button>
+            </div>
+            <!-- 编辑模式按钮组 -->
+            <div id="edit-btn-group" class="hidden" style="display: flex; gap: 1rem; flex-wrap: wrap;">
+                <button type="button" id="update-images-btn" class="secondary-btn" style="flex: 1; min-width: 160px; padding: 0.85rem; font-size: 1rem; border-radius: var(--radius-sm); cursor: pointer;" title="仅更新 Notion 中的封面属性与页面背景横幅/图标，不动文字">🖼️ 仅更新图片</button>
+                <button type="button" id="update-all-btn" class="primary-btn" style="flex: 2; min-width: 220px; padding: 0.85rem; font-size: 1rem; border-radius: var(--radius-sm); cursor: pointer; background-color: var(--accent-blue); color: white; border: none; font-weight: 600;" title="更新所有字段及选中的图片到 Notion">🔄 更新全部字段</button>
+            </div>
+        </section>
+    </main>
+
+    <!-- Settings Modal -->
+    <div id="settings-modal" class="modal-overlay hidden">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2>⚙️ 设置 (Settings)</h2>
+                <button id="close-settings-btn" class="close-btn">&times;</button>
+            </div>
+            <div class="modal-body">
+                <section class="settings-section">
+                    <h3>API Keys</h3>
+                    <form autocomplete="off" onsubmit="return false;">
+                        <!-- Decoy fields to capture browser password manager autofill -->
+                        <input type="text" style="display:none" autocomplete="username" tabindex="-1">
+                        <input type="password" style="display:none" autocomplete="current-password" tabindex="-1">
+                        <div class="form-group">
+                            <label for="notion-token">Notion Integration Token</label>
+                            <div class="password-input">
+                                <input type="password" id="notion-token" autocomplete="new-password">
+                                <button type="button" class="toggle-password" data-target="notion-token">👁️</button>
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label for="sgdb-key">SteamGridDB API Key</label>
+                            <div class="password-input">
+                                <input type="password" id="sgdb-key" autocomplete="new-password">
+                                <button type="button" class="toggle-password" data-target="sgdb-key">👁️</button>
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label for="steam-api-key">Steam Web API Key (<a href="https://steamcommunity.com/dev/apikey" target="_blank" style="color:var(--primary);text-decoration:underline;">免费申请</a>)</label>
+                            <div class="password-input">
+                                <input type="password" id="steam-api-key" autocomplete="new-password" placeholder="用于获取游戏游玩时长...">
+                                <button type="button" class="toggle-password" data-target="steam-api-key">👁️</button>
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label for="steam-id64">Steam 64位 ID (<a href="https://steamid.io/" target="_blank" style="color:var(--primary);text-decoration:underline;">steamid.io 查询</a>)</label>
+                            <input type="text" id="steam-id64" placeholder="76561198xxxxxxxxx (需个人资料游戏详情公开)">
+                        </div>
+                        <div class="form-group">
+                            <label for="proxy-url">网络代理 (Proxy，可选)</label>
+                            <input type="text" id="proxy-url" placeholder="留空默认自动检测系统代理/直连 (如: http://127.0.0.1:7890)">
+                            <small style="color:var(--text-secondary);font-size:0.8rem;display:block;margin-top:4px;">
+                                兼容规则模式、TUN、全局、加速器(Watt Toolkit)及修改Hosts。如在规则模式下Steam接口超时，可填入本地代理端口。
+                            </small>
+                        </div>
+                        <button id="save-keys-btn" class="secondary-btn">保存配置</button>
+                    </form>
+                </section>
+
+                <section class="settings-section">
+                    <h3>Database Selection</h3>
+                    <button id="fetch-dbs-btn" class="secondary-btn">加载数据库列表</button>
+                    <div class="form-group mt-2">
+                        <label for="db-select">选择数据库</label>
+                        <select id="db-select" disabled>
+                            <option value="">-- 请先加载数据库 --</option>
+                        </select>
+                    </div>
+                </section>
+
+                <section class="settings-section">
+                    <h3>字段映射 - 将Steam数据映射到你的Notion属性</h3>
+                    <div class="table-responsive">
+                        <table id="mapping-table" class="mapping-table">
+                            <thead>
+                                <tr>
+                                    <th>启用</th>
+                                    <th>数据字段 (Data Field)</th>
+                                    <th>Notion 属性 (Property)</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <!-- Rows will be dynamically populated -->
+                            </tbody>
+                        </table>
+                    </div>
+                </section>
+
+                <section class="settings-section">
+                    <h3>页面设置 (Page-Level Settings)</h3>
+                    <label class="checkbox-label">
+                        <input type="checkbox" id="use-hero-cover" checked>
+                        使用 Hero 图片作为页面 Cover
+                    </label>
+                    <label class="checkbox-label">
+                        <input type="checkbox" id="use-icon-icon" checked>
+                        使用 Icon 作为页面图标
+                    </label>
+                </section>
+            </div>
+            <div class="modal-footer">
+                <button id="save-config-btn" class="primary-btn">保存配置</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Toast Container -->
+    <div id="toast-container"></div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>
