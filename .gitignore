@@ -1,6 +1,10 @@
 # Sensitive configuration containing API tokens
 config.json
 
+# Local scratch / verification artifacts (may contain copies of secrets — never commit)
+*.e2e.json
+_*_tmp.*
+
 # Handover and internal notes
 HANDOVER*
 *.log
