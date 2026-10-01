@@ -6,6 +6,7 @@ import html
 import asyncio
 from contextlib import asynccontextmanager
 import threading
+import time
 import webbrowser
 from pathlib import Path
 from typing import Dict, Any, Optional
@@ -39,9 +40,6 @@ if sys.platform == "win32":
     except Exception:
         pass
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
 # 判断是否处于 PyInstaller 打包环境
 IS_FROZEN = getattr(sys, 'frozen', False)
 if IS_FROZEN:
@@ -55,19 +53,57 @@ else:
 
 STATIC_DIR = BUNDLE_DIR / "static"
 CONFIG_FILE = APP_DIR / "config.json"
+LOG_FILE = APP_DIR / "steamtonotion.log"
+
+# 日志：控制台输出格式保持原样不变；同时滚动写入 APP_DIR/steamtonotion.log（2MB × 3 份）。
+# 目的：打包版关闭黑框后控制台内容即丢失，有文件日志才能在用户报错时复盘。
+CONSOLE_LOG_FORMAT = "%(levelname)s:%(name)s:%(message)s"
+FILE_LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+
+def setup_logging():
+    from logging.handlers import RotatingFileHandler
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    for h in list(root.handlers):
+        root.removeHandler(h)
+
+    console = logging.StreamHandler(sys.stdout)
+    console.setFormatter(logging.Formatter(CONSOLE_LOG_FORMAT))
+    root.addHandler(console)
+
+    try:
+        file_handler = RotatingFileHandler(LOG_FILE, maxBytes=2 * 1024 * 1024, backupCount=3, encoding="utf-8")
+        file_handler.setFormatter(logging.Formatter(FILE_LOG_FORMAT))
+        root.addHandler(file_handler)
+    except Exception as log_err:
+        print(f"[WARN] 无法创建日志文件 {LOG_FILE}: {log_err}", file=sys.stderr)
+
+    # httpx 的 INFO 级别会打印完整请求 URL，而 Steam Web API 的 key 位于查询参数中，
+    # 为避免 API Key 被写进日志文件，这里只保留 httpx 的告警及以上级别。
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    return root
+
+setup_logging()
+logger = logging.getLogger(__name__)
 
 http_client: Optional[httpx.AsyncClient] = None
+http_client_proxy: str = ""  # 记录当前连接池实际使用的代理，用于判断是否需要重建
 config_lock = threading.Lock()
 
+def effective_proxy(proxy: Optional[str] = None) -> str:
+    """返回应当生效的代理：显式传入优先，否则读取已保存的配置。"""
+    if proxy is not None:
+        return (proxy or "").strip()
+    try:
+        return (load_config().get("proxy") or "").strip()
+    except Exception:
+        return ""
+
 def create_http_client(proxy: Optional[str] = None) -> httpx.AsyncClient:
-    proxy_url = proxy
-    if proxy_url is None:
-        try:
-            cfg = load_config()
-            proxy_url = (cfg.get("proxy") or "").strip()
-        except Exception:
-            proxy_url = ""
-            
+    global http_client_proxy
+    proxy_url = effective_proxy(proxy)
+    http_client_proxy = proxy_url
+
     transport_kwargs: Dict[str, Any] = {
         "retries": 1,
         "verify": False,
@@ -103,24 +139,46 @@ def create_http_client(proxy: Optional[str] = None) -> httpx.AsyncClient:
 
 async def safe_close_client(client: httpx.AsyncClient):
     try:
-        await asyncio.sleep(2.0)
+        # 宽限期必须大于最长请求超时（Notion 12s），否则换池会把飞行中的请求直接打断
+        await asyncio.sleep(20.0)
         if not client.is_closed:
             await client.aclose()
     except Exception:
         pass
 
-async def reset_client(proxy: Optional[str] = None) -> httpx.AsyncClient:
+async def reset_client(proxy: Optional[str] = None, force: bool = False) -> httpx.AsyncClient:
+    """重建（或复用）全局 HTTP 连接池。
+
+    代理未变化且未强制重建时直接复用现有连接池——这样"保存配置"不会无谓换池，
+    也就不会把此刻飞行中的 Steam/Notion 请求打断（旧连接池由安全关闭任务在宽限期后回收）。
+    """
     global http_client
+    target_proxy = effective_proxy(proxy)
+    if not force and http_client is not None and not http_client.is_closed and target_proxy == http_client_proxy:
+        logger.info("reset_client: proxy unchanged, reusing existing connection pool")
+        return http_client
     old_client = http_client
     http_client = create_http_client(proxy=proxy)
     if old_client is not None and not old_client.is_closed:
         asyncio.create_task(safe_close_client(old_client))
     return http_client
 
+_last_auto_heal_ts = 0.0
+
 async def auto_heal_client():
-    """Safely recreate HTTP client pool when connection issues occur."""
+    """Safely recreate HTTP client pool when connection issues occur.
+
+    带 5 秒节流：网络中断时多个请求会同时报连接错误，避免短时间内反复换池。
+    """
+    global _last_auto_heal_ts
+    now = time.monotonic()
+    if now - _last_auto_heal_ts < 5.0:
+        logger.info("auto_heal_client skipped (throttled within 5s)")
+        return
+    _last_auto_heal_ts = now
     try:
-        await reset_client()
+        await reset_client(force=True)
+        logger.info("HTTP client pool rebuilt after connection issue")
     except Exception as e:
         logger.warning(f"Error during auto_heal_client: {e}")
 
@@ -141,10 +199,12 @@ def get_client() -> httpx.AsyncClient:
 
 app = FastAPI(title="Steam to Notion Backend", lifespan=lifespan)
 
+# 安全加固：本工具为纯本地同源应用（前端所有请求都是相对路径），无需开放跨域。
+# 原 allow_origins=["*"] + allow_credentials=True 会让任意网页都能读取/调用本地 API。
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -207,6 +267,46 @@ GENRE_TRANSLATIONS = {
     "Short": "短片",
     "Tutorial": "教程"
 }
+
+CJK_CHAR_RE = re.compile(r'[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]')
+LATIN_CHAR_RE = re.compile(r'[A-Za-z]')
+
+def strip_embedded_english(name: str) -> str:
+    """官方名称里"中文名 + 英文原名"混写时，剥掉英文部分，只留本地化名称。
+
+    只处理两种"一眼可辨"的形态，其余一律原样返回（绝不猜测、绝不按空格硬拆）：
+
+      1) 尾部括号内为纯英文：'空战奇兵8 希孚之翼 (ACE COMBAT 8: WINGS OF THEVE)' -> '空战奇兵8 希孚之翼'
+      2) 冒号分隔且一侧纯中文、另一侧纯英文：'Valheim: 英灵神殿' -> '英灵神殿'
+
+    刻意不处理"空格分隔"（如 '仁王 Complete Edition'）：这类名字里的英文往往是版本后缀
+    （Complete Edition / Deluxe / Remastered 等）而不是英文原名，拆掉会丢信息。
+    中文名自带冒号的情况（'全面战争：战锤3'、'极限竞速：地平线 5'）因两侧都是中文而不会被改动。
+    """
+    if not name or not isinstance(name, str):
+        return name
+    name = name.strip()
+
+    # 形态 1：尾部括号内是纯英文
+    m = re.match(r'^(.*?)\s*[（(]\s*([^)）]*?)\s*[)）]\s*$', name)
+    if m:
+        head, tail = m.group(1).strip(), m.group(2).strip()
+        if head and tail and CJK_CHAR_RE.search(head) and LATIN_CHAR_RE.search(tail) and not CJK_CHAR_RE.search(tail):
+            return head
+
+    # 形态 2：冒号分隔，一侧纯中文、另一侧纯英文
+    m = re.match(r'^(.*?)\s*[:：]\s*(.*)$', name)
+    if m:
+        a, b = m.group(1).strip(), m.group(2).strip()
+        if a and b:
+            a_cjk, a_lat = bool(CJK_CHAR_RE.search(a)), bool(LATIN_CHAR_RE.search(a))
+            b_cjk, b_lat = bool(CJK_CHAR_RE.search(b)), bool(LATIN_CHAR_RE.search(b))
+            if a_cjk and not a_lat and b_lat and not b_cjk:
+                return a
+            if b_cjk and not b_lat and a_lat and not a_cjk:
+                return b
+
+    return name
 
 def decode_unicode_escapes(s: str) -> str:
     """Decode raw unicode escape sequences like \\u89d2\\u8272 into real characters."""
@@ -277,7 +377,13 @@ async def update_config(request: Request):
         for k, v in new_config.items():
             if k in ["notion_token", "steamgriddb_key", "steam_api_key"] and isinstance(v, str) and v.startswith("***"):
                 continue # don't overwrite with masked string
+            # 空 database_id 视为"未选择数据库"，直接忽略，避免前端未加载数据库列表时清空已保存的库
+            if k == "database_id" and not (isinstance(v, str) and v.strip()):
+                continue
             if k == "field_mapping" and isinstance(v, dict):
+                # 空映射视为无效输入（前端映射表未渲染时会提交 {}），忽略以避免清空已有映射
+                if not v:
+                    continue
                 # Preserve existing type and enabled state
                 old_mapping = config.get("field_mapping", {})
                 merged_mapping = {}
@@ -292,6 +398,10 @@ async def update_config(request: Request):
                             "enabled": bool(is_enabled)
                         }
                     else:
+                        merged_mapping[mk] = mv
+                # 本次未提交的字段（如历史遗留键）保持原样，避免被静默丢弃
+                for mk, mv in old_mapping.items():
+                    if mk not in merged_mapping:
                         merged_mapping[mk] = mv
                 config[k] = merged_mapping
             elif isinstance(v, dict) and k in config and isinstance(config[k], dict):
@@ -613,16 +723,31 @@ async def get_steam_data(app_id: str):
         except Exception as e:
             logger.warning(f"Error parsing en_res: {e}")
 
-    # If both cn and en failed, retry cn once before giving up
-    if not cn_data.get("success") and not en_data.get("success"):
+    # 单语失败重试：中/英两个 appdetails 是并发请求，Steam 会限流，实际经常只成功其中一个。
+    # 失败的一侧在这里单独串行重试一次，避免出现"中文名丢失"或"英文全名丢失"。
+    for _lang, _slot in (("schinese", "cn"), ("english", "en")):
+        if (cn_data if _slot == "cn" else en_data).get("success"):
+            continue
         try:
-            retry_res = await client.get(f"https://store.steampowered.com/api/appdetails?appids={app_id}&l=schinese", headers=headers, timeout=10.0)
+            await asyncio.sleep(0.5)
+            retry_res = await client.get(
+                f"https://store.steampowered.com/api/appdetails?appids={app_id}&l={_lang}",
+                headers=headers, timeout=10.0
+            )
             if retry_res.status_code == 200:
                 retry_json = retry_res.json()
                 r_key = next(iter(retry_json), None)
-                cn_data = retry_json.get(r_key, {}) if r_key else {}
+                retry_data = retry_json.get(r_key, {}) if r_key else {}
+                if retry_data.get("success"):
+                    if _slot == "cn":
+                        cn_data = retry_data
+                    else:
+                        en_data = retry_data
+                    logger.info(f"Retried {_lang} appdetails for {app_id}: ok")
+                else:
+                    logger.warning(f"Retried {_lang} appdetails for {app_id}: still unsuccessful")
         except Exception as e:
-            logger.warning(f"Retry appdetails failed: {e}")
+            logger.warning(f"Retry {_lang} appdetails failed for {app_id}: {type(e).__name__} {e}")
 
     # HTML store page fallback parsing if store_res succeeded
     html_desc = ""
@@ -678,7 +803,14 @@ async def get_steam_data(app_id: str):
         title_cn = title_en
     
     cjk_pattern = re.compile(r'[\u4e00-\u9fff\u3400-\u4dbf]')
-    has_chinese_name = bool(cjk_pattern.search(title_cn))
+    # "本地化名称"判定：只要官方名称不是英文名就算（简体/繁体中文、日文汉字与假名、韩文等一律算）。
+    # 做法与字符集/语言无关：比较"简中接口名称"与"英文接口名称"是否不同（忽略大小写与首尾空格）。
+    # 两者相同 ⇒ 说明该游戏没有本地化名称（官方名称本身就是英文名），
+    # 此时不应把同一个名字同时写进「游戏名称」和「全名」两列。
+    has_localized_name = title_cn.strip().lower() != title_en.strip().lower()
+    # 官方简中名自身可能混着英文原名（如 "空战奇兵8 希孚之翼 (ACE COMBAT 8: WINGS OF THEVE)"、"Valheim: 英灵神殿"）：
+    # 只在"一眼可辨"的两种形态下剥离英文部分作为「游戏名称」；「全名」始终取英文接口名称，不从解析结果推断。
+    display_title = strip_embedded_english(title_cn) if has_localized_name else title_en
     
     description = cn_app.get("short_description", "")
     if not description or (len(description) < 10 and not cjk_pattern.search(description)):
@@ -829,9 +961,12 @@ async def get_steam_data(app_id: str):
 
     return {
         "app_id": int(app_id) if app_id.isdigit() else app_id,
-        "title": title_cn if has_chinese_name else title_en,
-        "title_en": title_en,
-        "has_chinese_name": has_chinese_name,
+        "title": display_title,
+        # 仅当"游戏名称"确实取到非英文的本地化名称时，才回填英文全名(别名)：
+        # 官方只有英文名时，不再把同一个英文名重复写进两列
+        "title_en": title_en if has_localized_name else "",
+        # 兼容字段名：语义为"是否取到非英文的本地化名称"
+        "has_chinese_name": has_localized_name,
         "description": description,
         "developers": en_app.get("developers", []) or html_devs,
         "publishers": en_app.get("publishers", []) or html_pubs,
@@ -1004,16 +1139,19 @@ NOTION_FIELD_ALIASES = {
     "steam_url": ["steam_url", "steam url", "url", "link", "steam链接", "链接", "steam"]
 }
 
+# 说明：上面的 NOTION_FIELD_ALIASES 后端已不再使用——字段映射严格按用户选择的属性名，
+# 该表保留仅为将来需要恢复"未映射时自动推荐"功能时可用。
+
 async def ensure_field_mapping_healthy(mapping: dict, db_id: str, token: str) -> dict:
-    """If critical fields (e.g. tags, genre, title) have an empty or unmatched name, try auto-discovering from Notion DB schema."""
-    needs_heal = False
-    for k in ["tags", "genre", "title"]:
-        conf = mapping.get(k)
-        if not conf or not conf.get("name") or conf.get("name") == "":
-            needs_heal = True
-            break
-            
-    if not needs_heal or not db_id or not token:
+    """仅做"映射体检"：把用户已选定、但当前数据库里不存在的属性名告警出来。
+
+    设计原则：字段映射严格以用户选择的 Notion 属性名为准，与该属性叫什么名字无关
+    —— Steam 抓到的 tags 写进用户指定的某一列，Steam 抓到的类型写进用户指定的另一列。
+    **本函数不补齐、不改写、不启用任何字段**：
+      * 未映射（属性名为空）的字段一律不写；
+      * 已选定的名字即使当前库里不存在，也只告警保留（历史版本会按别名重新猜列，已移除）。
+    """
+    if not db_id or not token or not mapping:
         return mapping
 
     headers = {
@@ -1023,35 +1161,20 @@ async def ensure_field_mapping_healthy(mapping: dict, db_id: str, token: str) ->
     client = get_client()
     try:
         r = await client.get(f"https://api.notion.com/v1/databases/{db_id}", headers=headers, timeout=6.0)
-        if r.status_code == 200:
-            db_props = r.json().get("properties", {})
-            updated_any = False
-            for k in ["tags", "genre", "title", "cover_grid", "release_date", "playtime", "developer", "publisher"]:
-                conf = mapping.get(k, {})
-                cur_name = conf.get("name", "")
-                if not cur_name or cur_name not in db_props:
-                    aliases = NOTION_FIELD_ALIASES.get(k, [])
-                    for alias in aliases:
-                        a_clean = alias.strip().lower()
-                        for p_name, p_info in db_props.items():
-                            if p_name.strip().lower() == a_clean:
-                                mapping[k] = {
-                                    "name": p_name,
-                                    "type": p_info.get("type", conf.get("type", "multi_select")),
-                                    "enabled": True
-                                }
-                                logger.info(f"Self-healed unmapped field '{k}' -> Notion property '{p_name}' ({p_info.get('type')})")
-                                updated_any = True
-                                break
-                        if mapping.get(k, {}).get("name"):
-                            break
-            if updated_any:
-                cfg = load_config()
-                cfg["field_mapping"] = mapping
-                save_config(cfg)
+        if r.status_code != 200:
+            logger.warning(f"Field-mapping check skipped: Notion returned {r.status_code}")
+            return mapping
+
+        db_props = r.json().get("properties", {})
+        for k, conf in mapping.items():
+            name = (conf or {}).get("name") or ""
+            if not name:
+                continue
+            if name not in db_props:
+                logger.warning(f"字段映射 '{k}' -> '{name}' 在当前 Notion 数据库中不存在（不会写入，也不会被自动替换），请在设置中确认")
     except Exception as e:
-        logger.warning(f"Failed to auto-heal field mapping from Notion: {e}")
-        
+        logger.warning(f"Failed to check field mapping against Notion: {e}")
+
     return mapping
 
 @app.post("/api/notion/create")
@@ -1118,9 +1241,15 @@ async def create_notion_page(request: Request):
             prop_val = {"rich_text": [{"text": {"content": text_str[:2000]}}]}
         elif ptype == "multi_select":
             items = value if isinstance(value, list) else [value]
-            # Notion multi_select doesn't allow commas in option names — replace with space
-            cleaned = [str(v).replace(",", "").strip()[:100] for v in items if v]
-            prop_val = {"multi_select": [{"name": n} for n in cleaned if n]}
+            # Notion 的 multi_select 不允许选项名含逗号（用空格替换），也不允许出现重复选项名（会直接 400）
+            cleaned = []
+            for v in items:
+                if not v:
+                    continue
+                n = str(v).replace(",", "").strip()[:100]
+                if n and n not in cleaned:
+                    cleaned.append(n)
+            prop_val = {"multi_select": [{"name": n} for n in cleaned]}
         elif ptype == "select":
             v = value[0] if isinstance(value, list) and value else value
             if v:
@@ -1178,9 +1307,21 @@ async def create_notion_page(request: Request):
             return JSONResponse(status_code=400, content={"status": "error", "message": res.text})
         page_res = res.json()
         return {"status": "success", "url": page_res.get("url")}
-    except (httpx.ConnectTimeout, httpx.ConnectError) as ce:
+    except (httpx.ConnectTimeout, httpx.ConnectError, httpx.ReadTimeout) as ce:
         logger.warning(f"Notion create page connection issue: {type(ce).__name__}")
         await auto_heal_client()
+        # 超时后无法确定页面是否已建立：主动核对一次，避免用户重试时产生重复页面
+        reconciled = None
+        try:
+            reconciled = await find_existing_notion_page(
+                token, db_id, mapping,
+                game.get("title", ""), game.get("title_en", ""), game.get("steam_url", "")
+            )
+        except Exception as re_err:
+            logger.warning(f"Create-page timeout reconciliation failed: {re_err}")
+        if reconciled:
+            logger.info(f"Page exists despite timeout, treated as created: {reconciled.get('url')}")
+            return {"status": "success", "url": reconciled.get("url"), "reconciled": True}
         return JSONResponse(
             status_code=502,
             content={"status": "error", "message": "连接 Notion 服务器超时或失败。国内直连 Notion 可能会受网络限制，请在设置中配置代理（例如 http://127.0.0.1:7890）或开启加速工具。"}
@@ -1233,9 +1374,112 @@ def extract_notion_page_image(img_obj: dict) -> str:
         return img_obj.get("file", {}).get("url", "")
     return ""
 
+def _notion_match_condition(prop_name: str, prop_type: Optional[str], value: str, url_variants: bool = False) -> Optional[dict]:
+    """按 Notion 属性的真实类型构造等值匹配条件。
+    原先写死 title/url 类型：一旦该属性是 rich_text/select，Notion 会返回 400 并被静默吞掉，导致查重失效。"""
+    if not prop_name or not value:
+        return None
+    ptype = (prop_type or "").strip() or ("url" if url_variants else "title")
+    values = [value.rstrip("/"), value.rstrip("/") + "/"] if url_variants else [value]
+    conds = []
+    for v in values:
+        if ptype == "rich_text":
+            conds.append({"property": prop_name, "rich_text": {"equals": v}})
+        elif ptype == "select":
+            conds.append({"property": prop_name, "select": {"equals": v}})
+        elif ptype == "url":
+            conds.append({"property": prop_name, "url": {"equals": v}})
+        else:
+            conds.append({"property": prop_name, "title": {"equals": v}})
+    return {"or": conds} if len(conds) > 1 else conds[0]
+
+async def find_existing_notion_page(token: str, db_id: str, mapping: dict,
+                                    title: str = "", title_en: str = "", steam_url: str = "") -> Optional[dict]:
+    """在 Notion 数据库中查找已存在的游戏页面：先按 Steam 链接精确匹配，再按名称匹配，返回原始页面对象或 None。
+
+    供 /api/notion/search（前端查重）与创建页面超时后的核对逻辑复用。
+    只要映射里配置了属性名即参与匹配（不因该字段"不写入 Notion"而跳过查重）。
+    """
+    if not token or not db_id:
+        return None
+
+    title = (title or "").strip()
+    title_en = (title_en or "").strip()
+    steam_url = (steam_url or "").strip()
+
+    url_conf = mapping.get("steam_url") or {}
+    title_conf = mapping.get("title") or {}
+    title_en_conf = mapping.get("title_en") or {}
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Notion-Version": "2022-06-28",
+        "Content-Type": "application/json"
+    }
+    client = get_client()
+
+    async def _query(filter_query: dict) -> Optional[dict]:
+        try:
+            res = await client.post(
+                f"https://api.notion.com/v1/databases/{db_id}/query",
+                headers=headers,
+                json={"filter": filter_query, "page_size": 1},
+                timeout=8.0
+            )
+            if res.status_code == 200:
+                results = res.json().get("results", [])
+                if results:
+                    return results[0]
+            else:
+                logger.warning(f"Notion dedupe query returned {res.status_code}: {res.text[:300]}")
+        except Exception as e:
+            logger.warning(f"Notion dedupe query failed: {type(e).__name__} {e}")
+        return None
+
+    # Priority 1: Exact match by steam_url
+    url_cond = _notion_match_condition(url_conf.get("name") or "", url_conf.get("type"), steam_url, url_variants=True)
+    if url_cond:
+        matched = await _query(url_cond)
+        if matched:
+            logger.info(f"Notion dedupe matched by steam_url ('{url_conf.get('name')}'): {matched.get('url')}")
+            return matched
+
+    # 中/英文名两个取值都参与名称匹配（去重后），按目标属性的真实类型构造条件
+    name_values = []
+    for v in (title, title_en):
+        if v and v not in name_values:
+            name_values.append(v)
+
+    async def _match_by_property(prop_conf: dict, label: str) -> Optional[dict]:
+        prop_name = (prop_conf.get("name") or "").strip()
+        conds = [c for c in (
+            _notion_match_condition(prop_name, prop_conf.get("type"), v) for v in name_values
+        ) if c]
+        if not conds:
+            return None
+        hit = await _query({"or": conds} if len(conds) > 1 else conds[0])
+        if hit:
+            logger.info(f"Notion dedupe matched by {label} ('{prop_name}'): {hit.get('url')}")
+        return hit
+
+    # Priority 2: 按「游戏名称」列匹配
+    matched = await _match_by_property(title_conf, "游戏名称")
+    if matched:
+        return matched
+
+    # Priority 3: 按「英文全名」列匹配（两列配置不同时才查）
+    # 英文名唯一性高，且不受中文名被改写/拆分的影响，可以命中"旧条目仍写着旧中文名"的情况
+    title_en_prop = (title_en_conf.get("name") or "").strip()
+    if title_en_prop and title_en_prop != (title_conf.get("name") or "").strip():
+        matched = await _match_by_property(title_en_conf, "英文全名")
+        if matched:
+            return matched
+
+    return None
+
 @app.post("/api/notion/search")
 async def search_existing_notion_game(request: Request):
-    """Search if game already exists in Notion DB by steam_url (exact) or title (or)."""
+    """Search if game already exists in Notion DB by steam_url (exact) or title."""
     config = load_config()
     token = config.get("notion_token")
     db_id = config.get("database_id")
@@ -1247,75 +1491,13 @@ async def search_existing_notion_game(request: Request):
     except Exception:
         body = {}
 
-    title = (body.get("title") or "").strip()
-    title_en = (body.get("title_en") or "").strip()
-    steam_url = (body.get("steam_url") or "").strip()
-
     mapping = config.get("field_mapping", {})
-    url_prop_name = None
-    title_prop_name = None
-    for src_key, field_conf in mapping.items():
-        if field_conf.get("enabled", True):
-            if src_key == "steam_url":
-                url_prop_name = field_conf.get("name")
-            elif src_key == "title":
-                title_prop_name = field_conf.get("name")
-
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Notion-Version": "2022-06-28",
-        "Content-Type": "application/json"
-    }
-    client = get_client()
-    matched_page = None
-
-    # Priority 1: Exact match by steam_url
-    if url_prop_name and steam_url:
-        try:
-            norm_url1 = steam_url.rstrip("/")
-            norm_url2 = norm_url1 + "/"
-            filter_query = {
-                "or": [
-                    {"property": url_prop_name, "url": {"equals": norm_url1}},
-                    {"property": url_prop_name, "url": {"equals": norm_url2}}
-                ]
-            }
-            res = await client.post(
-                f"https://api.notion.com/v1/databases/{db_id}/query",
-                headers=headers,
-                json={"filter": filter_query, "page_size": 1},
-                timeout=8.0
-            )
-            if res.status_code == 200:
-                results = res.json().get("results", [])
-                if results:
-                    matched_page = results[0]
-        except Exception as e:
-            logger.warning(f"Error querying Notion by steam_url: {e}")
-
-    # Priority 2: Match by game title
-    if not matched_page and title_prop_name:
-        or_titles = []
-        if title:
-            or_titles.append({"property": title_prop_name, "title": {"equals": title}})
-        if title_en and title_en != title:
-            or_titles.append({"property": title_prop_name, "title": {"equals": title_en}})
-
-        if or_titles:
-            try:
-                filter_query = {"or": or_titles} if len(or_titles) > 1 else or_titles[0]
-                res = await client.post(
-                    f"https://api.notion.com/v1/databases/{db_id}/query",
-                    headers=headers,
-                    json={"filter": filter_query, "page_size": 1},
-                    timeout=8.0
-                )
-                if res.status_code == 200:
-                    results = res.json().get("results", [])
-                    if results:
-                        matched_page = results[0]
-            except Exception as e:
-                logger.warning(f"Error querying Notion by title: {e}")
+    matched_page = await find_existing_notion_page(
+        token, db_id, mapping,
+        (body.get("title") or "").strip(),
+        (body.get("title_en") or "").strip(),
+        (body.get("steam_url") or "").strip()
+    )
 
     if not matched_page:
         return {"found": False}
@@ -1369,9 +1551,19 @@ async def update_notion_page(request: Request):
     images = data.get("images", {})
     steam_images = game.get("steam_images", {})
 
-    grid_img = images.get("grid") or steam_images.get("header") or game.get("header_image") or steam_images.get("library_grid") or ""
-    hero_img = images.get("hero") or steam_images.get("library_hero") or ""
-    icon_img = images.get("icon") or steam_images.get("clienticon") or steam_images.get("official_logo") or steam_images.get("icon") or ""
+    def resolve_selected_image(key: str, *fallbacks: str) -> str:
+        """前端始终会提交 grid/hero/icon 三个键：键存在且为空串 = 用户主动取消选中，此时不得用官方图回填。
+        仅当键未提交（旧版前端/第三方调用）时才回退到 Steam 官方图片。"""
+        if key in images:
+            return (images.get(key) or "").strip()
+        for f in fallbacks:
+            if f:
+                return f
+        return ""
+
+    grid_img = resolve_selected_image("grid", steam_images.get("header") or "", game.get("header_image") or "", steam_images.get("library_grid") or "")
+    hero_img = resolve_selected_image("hero", steam_images.get("library_hero") or "")
+    icon_img = resolve_selected_image("icon", steam_images.get("clienticon") or "", steam_images.get("official_logo") or "", steam_images.get("icon") or "")
 
     db_id = config.get("database_id")
     mapping = config.get("field_mapping", {})
@@ -1416,8 +1608,15 @@ async def update_notion_page(request: Request):
                 prop_val = {"rich_text": [{"text": {"content": text_str[:2000]}}]}
             elif ptype == "multi_select":
                 items = value if isinstance(value, list) else [value]
-                cleaned = [str(v).replace(",", "").strip()[:100] for v in items if v]
-                prop_val = {"multi_select": [{"name": n} for n in cleaned if n]}
+                # Notion 的 multi_select 不允许选项名含逗号（用空格替换），也不允许出现重复选项名（会直接 400）
+                cleaned = []
+                for v in items:
+                    if not v:
+                        continue
+                    n = str(v).replace(",", "").strip()[:100]
+                    if n and n not in cleaned:
+                        cleaned.append(n)
+                prop_val = {"multi_select": [{"name": n} for n in cleaned]}
             elif ptype == "select":
                 v = value[0] if isinstance(value, list) and value else value
                 if v:
@@ -1511,6 +1710,7 @@ if __name__ == "__main__":
     print("  [*] 访问地址: http://localhost:8000")
     print("  [*] 浏览器将自动为您打开，如未弹出请手动复制上方地址访问。")
     print("  [*] 关闭此黑框窗口即可退出程序。")
+    print(f"  [*] 运行日志: {LOG_FILE}")
     print("=" * 60 + "\n")
     
     # 打包模式下不能传字符串 "app:app"，必须直接传入 app 对象

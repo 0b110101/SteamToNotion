@@ -17,6 +17,9 @@ let appState = {
     notionProperties: {}
 };
 
+// 在途查重请求：提交前若查重尚未返回，必须先等它结束，避免在"已存在"的情况下重复建页
+let pendingExistenceCheck = null;
+
 // DOM Elements
 const els = {
     searchInput: document.getElementById('search-input'),
@@ -436,8 +439,8 @@ async function fetchGameById(appId) {
         populateGameForm();
         exitEditMode();
 
-        // 异步查询该游戏是否已存在于 Notion 中
-        checkNotionExistence(steamData);
+        // 异步查询该游戏是否已存在于 Notion 中（提交前会等待该请求，避免重复建页）
+        pendingExistenceCheck = checkNotionExistence(steamData).finally(() => { pendingExistenceCheck = null; });
 
         // Prepare Steam Official Images as primary/fallback options
         // 桌面图标 = clienticon, 库横幅 = pagecover (hero), Steam封面 = 封面 (grid)
@@ -951,50 +954,61 @@ async function onDatabaseSelect() {
     renderMappingTable();
 }
 
-function findBestMatchingProperty(field, compatibleProps, mappedProp) {
-    // 1. Exact match with mappedProp
-    if (mappedProp && compatibleProps.some(([name]) => name === mappedProp)) {
-        return mappedProp;
+// 解析某个字段应当选中的 Notion 属性（严格以用户的选择为准，不做任何猜测）：
+//   * 已映射（属性名非空）→ 原样采用，绝不按别名换列
+//   * 该属性名不在本次拉取的库结构里 → 也原样保留（让用户看到真实选择，写入时报错也好过写错列）
+//   * 未映射（属性名为空）→ 就是"不映射"，默认停在 -- 不映射 --，不再自动推荐
+function resolveMappedProperty(allProps, mappedProp) {
+    const names = Object.keys(allProps || {});
+    const wanted = (mappedProp || '').trim();
+    if (!wanted) {
+        return '';
     }
-    // 2. Case-insensitive / trimmed match with mappedProp
-    if (mappedProp) {
-        const clean = mappedProp.trim().toLowerCase();
-        const found = compatibleProps.find(([name]) => name.trim().toLowerCase() === clean);
-        if (found) return found[0];
-    }
-    // 3. Match against aliases (智能匹配常见中英文属性名)
-    const aliases = field.aliases || [];
-    for (const alias of aliases) {
-        const aClean = alias.trim().toLowerCase();
-        const found = compatibleProps.find(([name]) => name.trim().toLowerCase() === aClean);
-        if (found) return found[0];
-    }
-    return '';
+    const exact = names.find(n => n === wanted) ||
+                  names.find(n => n.trim().toLowerCase() === wanted.toLowerCase());
+    return exact || wanted;
 }
 
-function renderMappingTable() {
-    els.mappingTableBody.innerHTML = '';
-    const mapping = appState.config.field_mapping || {};
+// 记录上一次渲染映射表所依据的数据；数据没变时不再重建表格。
+// 目的：打开设置面板会异步拉取数据库列表并重渲染表格，若不加保护，
+// 会把用户刚刚取消/勾选的改动直接覆盖回去（历史 bug：取消勾选后又被全部勾上）。
+let lastMappingRenderKey = null;
 
+function renderMappingTable() {
+    const mapping = appState.config.field_mapping || {};
+    const allProps = appState.notionProperties || {};
+    const renderKey = JSON.stringify([appState.config.database_id || '', Object.keys(allProps).sort(), mapping]);
+    if (renderKey === lastMappingRenderKey && els.mappingTableBody.children.length > 0) {
+        return;   // 数据未变：保留当前表格（含用户尚未保存的勾选状态）
+    }
+    lastMappingRenderKey = renderKey;
+
+    els.mappingTableBody.innerHTML = '';
     DEFAULT_FIELDS.forEach(field => {
         const tr = document.createElement('tr');
         
-        // Enabled checkbox
+        // Enabled checkbox：配置里没有该字段时默认"未勾选"（尚未映射 → 不启用）
         const fieldConf = mapping[field.key];
-        const isEnabled = fieldConf ? (fieldConf.enabled !== false) : true;
+        const isEnabled = fieldConf ? (fieldConf.enabled !== false) : false;
         const currentMapped = fieldConf ? (fieldConf.property || '') : '';
 
-        // Filter compatible properties
-        const compatibleProps = Object.entries(appState.notionProperties || {})
-            .filter(([name, prop]) => field.type.includes(prop.type));
+        // 用户已选定的属性原样保留；未映射则为 "-- 不映射 --"
+        const mappedValue = resolveMappedProperty(allProps, currentMapped);
 
-        // Smart auto-matching
-        const bestMatch = findBestMatchingProperty(field, compatibleProps, currentMapped);
+        // 下拉项 = 类型兼容的属性 + 用户已选定的属性
+        // （即使其类型不在推荐范围内，也必须可见可选，否则用户的映射会被静默丢失）
+        const optionNames = Object.keys(allProps).filter(n => field.type.includes(allProps[n].type));
+        if (mappedValue && !optionNames.includes(mappedValue)) {
+            optionNames.unshift(mappedValue);
+        }
 
         let optionsHtml = '<option value="">-- 不映射 --</option>';
-        compatibleProps.forEach(([name, prop]) => {
-            const sel = (name === bestMatch) ? 'selected' : '';
-            optionsHtml += `<option value="${name}" ${sel}>${name} (${prop.type})</option>`;
+        optionNames.forEach(name => {
+            const propInfo = allProps[name];
+            const ptype = propInfo ? propInfo.type : '不在当前数据库';
+            const warn = (propInfo && !field.type.includes(ptype)) ? ' ⚠️类型不推荐' : '';
+            const sel = (name === mappedValue) ? 'selected' : '';
+            optionsHtml += `<option value="${name}" ${sel}>${name} (${ptype}${warn})</option>`;
         });
 
         tr.innerHTML = `
@@ -1033,12 +1047,15 @@ async function saveConfig() {
     });
 
     // Send backend-compatible config
+    // 注意：若数据库列表未成功加载，dbSelect 只有空占位、映射表为空，
+    // 此时绝不能把空值提交给后端，否则会清空已保存的数据库选择与字段映射。
     const backendConfig = {
-        database_id: els.dbSelect.value,
         use_hero_as_cover: els.useHeroCover.checked,
-        use_icon_as_page_icon: els.useIconIcon.checked,
-        field_mapping: backendMapping
+        use_icon_as_page_icon: els.useIconIcon.checked
     };
+    const selectedDbId = els.dbSelect.value;
+    if (selectedDbId) backendConfig.database_id = selectedDbId;
+    if (Object.keys(backendMapping).length > 0) backendConfig.field_mapping = backendMapping;
 
     const notionVal = els.notionToken.value.trim();
     const sgdbVal = els.sgdbKey.value.trim();
@@ -1057,11 +1074,11 @@ async function saveConfig() {
         });
         if (!res.ok) throw new Error('Save failed');
         
-        // Update local state
-        appState.config.database_id = backendConfig.database_id;
+        // Update local state（仅在本次确实提交了对应配置时同步，避免用空值覆盖本地状态）
+        if (backendConfig.database_id) appState.config.database_id = backendConfig.database_id;
         appState.config.use_hero_cover = backendConfig.use_hero_as_cover;
         appState.config.use_icon_icon = backendConfig.use_icon_as_page_icon;
-        appState.config.field_mapping = frontendMapping;
+        if (Object.keys(frontendMapping).length > 0) appState.config.field_mapping = frontendMapping;
         
         if (notionVal || sgdbVal || steamKeyVal || steamIdVal) {
             els.notionToken.value = '';
@@ -1080,6 +1097,15 @@ async function saveConfig() {
 // --- Submit ---
 
 async function handleSubmit() {
+    // 若查重仍在进行中，先等它结束：命中已存在条目时绝不能再新建，否则会产生重复页面
+    if (pendingExistenceCheck) {
+        try { await pendingExistenceCheck; } catch (e) { console.warn('Existence check failed:', e); }
+    }
+    if (appState.editMode) {
+        showToast('检测到该游戏已存在于 Notion 中（已自动切换为编辑模式），请使用「🖼️ 仅更新图片」或「🔄 更新全部字段」。', 'info');
+        return;
+    }
+
     // Gather current form data (user might have edited it)
     const gameToSubmit = {
         title: els.title.value.trim(),
@@ -1129,7 +1155,11 @@ async function handleSubmit() {
         }
 
         const notionLink = data.url ? `<a href="${data.url}" target="_blank" style="color: white; text-decoration: underline;">在 Notion 中查看</a>` : '已推送到 Notion 页面';
-        showToast(`🎉 成功！${notionLink}`, 'success');
+        if (data.reconciled) {
+            showToast(`⚠️ 请求超时，但已核对确认该页面在 Notion 中创建成功：${notionLink}`, 'success');
+        } else {
+            showToast(`🎉 成功！${notionLink}`, 'success');
+        }
         
         // Clear UI
         els.searchInput.value = '';
@@ -1206,28 +1236,29 @@ function exitEditMode() {
 
 function populateFormFromNotion(props) {
     if (!props) return;
-    const getVal = (key, fallbackName) => {
+    // 只读取"映射到该字段的 Notion 属性"的值：绝不按 "标签"/"类型" 等固定名字去猜别的列
+    // （后端已按映射把属性名翻译成 tags/genre 等 key，读不到就说明该字段未映射）
+    const getVal = (key) => {
         if (props[key] !== undefined && props[key] !== null) return props[key];
-        if (fallbackName && props[fallbackName] !== undefined && props[fallbackName] !== null) return props[fallbackName];
         return null;
     };
 
-    const titleVal = getVal('title', '游戏名称');
+    const titleVal = getVal('title');
     if (titleVal !== null) els.title.value = titleVal;
 
-    const titleEnVal = getVal('title_en', '全名');
+    const titleEnVal = getVal('title_en');
     if (titleEnVal !== null) els.titleEn.value = titleEnVal;
 
-    const devVal = getVal('developer', '开发商');
+    const devVal = getVal('developer');
     if (devVal !== null) els.developer.value = Array.isArray(devVal) ? devVal.join(', ') : devVal;
 
-    const pubVal = getVal('publisher', '发行商');
+    const pubVal = getVal('publisher');
     if (pubVal !== null) els.publisher.value = Array.isArray(pubVal) ? pubVal.join(', ') : pubVal;
 
-    const dateVal = getVal('release_date', '发行日期');
+    const dateVal = getVal('release_date');
     if (dateVal !== null) els.releaseDate.value = dateVal;
 
-    const playVal = getVal('playtime', '游玩时长');
+    const playVal = getVal('playtime');
     if (playVal !== null && els.playtime) {
         if (typeof playVal === 'number') {
             els.playtime.value = playVal;
@@ -1237,14 +1268,14 @@ function populateFormFromNotion(props) {
         }
     }
 
-    const descVal = getVal('description', '简介');
+    const descVal = getVal('description');
     if (descVal !== null) els.description.value = descVal;
 
-    const urlVal = getVal('steam_url', 'Steam链接');
+    const urlVal = getVal('steam_url');
     if (urlVal !== null) els.steamUrl.value = urlVal;
 
     // Genres 回填
-    const genresVal = getVal('genre', '类型');
+    const genresVal = getVal('genre');
     if (genresVal && appState.gameData) {
         const notionGenres = Array.isArray(genresVal) ? genresVal : [genresVal];
         appState.gameData.genres = notionGenres.filter(Boolean);
@@ -1252,7 +1283,7 @@ function populateFormFromNotion(props) {
     }
 
     // Tags 回填与高亮
-    const tagsVal = getVal('tags', '标签');
+    const tagsVal = getVal('tags');
     if (tagsVal && appState.gameData) {
         const rawNotionTags = Array.isArray(tagsVal) ? tagsVal : [tagsVal];
         const notionTags = rawNotionTags.map(decodeUnicodeString).filter(Boolean);

@@ -21,11 +21,6 @@
       "type": "files",
       "enabled": true
     },
-    "cover_hero": {
-      "name": "横幅",
-      "type": "files",
-      "enabled": false
-    },
     "genre": {
       "name": "类型",
       "type": "multi_select",
@@ -43,8 +38,8 @@
     },
     "playtime": {
       "name": "游玩时长",
-      "type": "rich_text",
-      "enabled": false
+      "type": "number",
+      "enabled": true
     },
     "developer": {
       "name": "开发商",
