@@ -1195,9 +1195,10 @@ async def create_notion_page(request: Request):
     steam_images = game.get("steam_images", {})
     
     # 桌面图标 = clienticon (优先) / official_logo / icon, 库横幅 = pagecover (hero), Steam封面 = 封面 (grid)
-    grid_img = images.get("grid") or steam_images.get("header") or game.get("header_image") or steam_images.get("library_grid") or ""
-    hero_img = images.get("hero") or steam_images.get("library_hero") or ""
-    icon_img = images.get("icon") or steam_images.get("clienticon") or steam_images.get("official_logo") or steam_images.get("icon") or ""
+    # sanitize_image_url：去掉链接末尾的 ?t=xxxxxx 缓存参数（带该参数在 Notion 中偶发不显示）
+    grid_img = sanitize_image_url(images.get("grid") or steam_images.get("header") or game.get("header_image") or steam_images.get("library_grid") or "")
+    hero_img = sanitize_image_url(images.get("hero") or steam_images.get("library_hero") or "")
+    icon_img = sanitize_image_url(images.get("icon") or steam_images.get("clienticon") or steam_images.get("official_logo") or steam_images.get("icon") or "")
     
     mapping = config.get("field_mapping", {})
     mapping = await ensure_field_mapping_healthy(mapping, db_id, token)
@@ -1373,6 +1374,30 @@ def extract_notion_page_image(img_obj: dict) -> str:
     elif itype == "file":
         return img_obj.get("file", {}).get("url", "")
     return ""
+
+IMAGE_URL_EXT_RE = re.compile(r'\.(?:jpg|jpeg|png|webp|gif|ico|bmp|svg|avif)$', re.IGNORECASE)
+
+def sanitize_image_url(url: str) -> str:
+    """把图片链接清理成"干净的、以图片扩展名结尾"的链接后再写入 Notion。
+
+    Steam 的商店接口会在图片链接后附加缓存参数（如 `header.jpg?t=1777363040`），
+    实测带该参数时 Notion 偶发不显示图片；链接末尾也可能出现 `#` 锚点。
+
+    规则：
+      * 去掉 `?` 之后的一切（查询串）与 `#` 之后的一切（锚点）；
+      * **仅当清理后的结果仍以常见图片扩展名结尾时才采用该结果**，否则原样返回（不误伤其它 URL）；
+      * 清理生效时记 INFO 日志、遇到"不认识的结尾"记 WARNING，便于排查。
+    """
+    if not url or not isinstance(url, str):
+        return url or ""
+    url = url.strip()
+    base = url.split("?", 1)[0].split("#", 1)[0].strip()
+    if base != url and IMAGE_URL_EXT_RE.search(base):
+        logger.info(f"图片链接已清理后缀: {url[:160]} -> {base[:160]}")
+        return base
+    if url and not IMAGE_URL_EXT_RE.search(url):
+        logger.warning(f"图片链接不以常见图片扩展名结尾，原样保留（未改写）: {url[:160]}")
+    return url
 
 def _notion_match_condition(prop_name: str, prop_type: Optional[str], value: str, url_variants: bool = False) -> Optional[dict]:
     """按 Notion 属性的真实类型构造等值匹配条件。
@@ -1561,9 +1586,9 @@ async def update_notion_page(request: Request):
                 return f
         return ""
 
-    grid_img = resolve_selected_image("grid", steam_images.get("header") or "", game.get("header_image") or "", steam_images.get("library_grid") or "")
-    hero_img = resolve_selected_image("hero", steam_images.get("library_hero") or "")
-    icon_img = resolve_selected_image("icon", steam_images.get("clienticon") or "", steam_images.get("official_logo") or "", steam_images.get("icon") or "")
+    grid_img = sanitize_image_url(resolve_selected_image("grid", steam_images.get("header") or "", game.get("header_image") or "", steam_images.get("library_grid") or ""))
+    hero_img = sanitize_image_url(resolve_selected_image("hero", steam_images.get("library_hero") or ""))
+    icon_img = sanitize_image_url(resolve_selected_image("icon", steam_images.get("clienticon") or "", steam_images.get("official_logo") or "", steam_images.get("icon") or ""))
 
     db_id = config.get("database_id")
     mapping = config.get("field_mapping", {})

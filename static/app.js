@@ -289,8 +289,14 @@ function bindEvents() {
     
     document.querySelectorAll('.toggle-password').forEach(btn => {
         btn.addEventListener('click', (e) => {
-            const input = document.getElementById(e.target.dataset.target);
-            input.type = input.type === 'password' ? 'text' : 'password';
+            const btnEl = e.currentTarget || e.target;
+            const input = document.getElementById(btnEl.dataset.target);
+            if (!input) return;
+            const willShow = input.type === 'password';
+            input.type = willShow ? 'text' : 'password';
+            // 文字标签跟随状态变化（原为 👁️ 图标，用户反馈图标观感差，改为"显示/隐藏"）
+            btnEl.textContent = willShow ? '隐藏' : '显示';
+            btnEl.title = willShow ? '隐藏内容' : '显示内容';
         });
     });
 
