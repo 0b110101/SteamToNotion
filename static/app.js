@@ -483,16 +483,19 @@ async function fetchGameById(appId) {
         }
 
         const officialIcons = [];
-        // 1. 最优先：Steam 客户端桌面图标 (clienticon.ico) - 真正的大图标 / 桌面图标
+        // 图标来源顺序：Steam 桌面图标（.ico，写入时由后端抽取内嵌 256×256 PNG 上传 Notion，真透明）
+        // → 官方高清透明 Logo(PNG) → 社区小图标(jpg)。
+        // 注：.ico 仅用于画廊预览（浏览器能正常显示），绝不会被写进 Notion（Notion 渲染 .ico 会空白）。
         if (steamImgs.clienticon) {
             officialIcons.push({
                 url: steamImgs.clienticon,
                 thumb: steamImgs.clienticon,
-                style: 'Steam 桌面图标 (clienticon)'
+                width: 256,
+                height: 256,
+                isDesktopIcon: true,
+                style: 'Steam 桌面图标（自动转 PNG）'
             });
         }
-
-        // 2. Steam 官方高清透明 Logo (logo.png / logo_2x.png)
         if (steamImgs.official_logo) {
             officialIcons.push({
                 url: steamImgs.official_logo,
@@ -504,8 +507,8 @@ async function fetchGameById(appId) {
             });
         }
 
-        // 3. Steam 社区小图标 (icon.jpg)
-        if (steamImgs.icon && steamImgs.icon !== steamImgs.clienticon) {
+        // Steam 社区小图标 (icon.jpg)
+        if (steamImgs.icon) {
             officialIcons.push({
                 url: steamImgs.icon,
                 thumb: steamImgs.icon,

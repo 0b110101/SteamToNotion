@@ -3,6 +3,7 @@ import sys
 import json
 import re
 import html
+import struct
 import asyncio
 from contextlib import asynccontextmanager
 import threading
@@ -655,6 +656,31 @@ async def get_single_playtime(app_id: str):
     playtime = await get_steam_playtime(app_id, config)
     return {"playtime": playtime}
 
+def parse_steamcmd_common(cmd_json: dict, app_id: str) -> tuple:
+    """从 steamcmd /v1/info 响应里取出 common 节点、库内资产表、社区小图标链接与桌面图标链接。
+
+    桌面图标（clienticon）在 CDN 上只有 `.ico` 格式，Notion 直接引用会渲染成空白，
+    因此同时产出配套的 `_full.jpg`（同名哈希的 184×184 JPG，约一半游戏才有）；
+    写入 Notion 时按四级兜底处理：.ico 内嵌 PNG（上传）→ _full.jpg → 官方 Logo → 社区小图标。
+    详见 HANDOVER 附录 L。
+    """
+    common = ((cmd_json or {}).get("data", {}) or {}).get(str(app_id), {}).get("common", {}) or {}
+    lib_assets = common.get("library_assets_full", {}) or {}
+    comm_hash = common.get("icon")
+    community_icon = (
+        f"https://shared.fastly.steamstatic.com/community_assets/images/apps/{app_id}/{comm_hash}.jpg"
+        if comm_hash else ""
+    )
+    cicon_hash = (common.get("clienticon") or "").strip()
+    if cicon_hash:
+        cicon_base = f"https://shared.fastly.steamstatic.com/community_assets/images/apps/{app_id}/{cicon_hash}"
+        clienticon_ico = f"{cicon_base}.ico"
+        clienticon_full = f"{cicon_base}_full.jpg"
+    else:
+        clienticon_ico = ""
+        clienticon_full = ""
+    return common, lib_assets, community_icon, clienticon_ico, clienticon_full
+
 @app.get("/api/steam/{app_id}")
 async def get_steam_data(app_id: str):
     if not app_id.isdigit():
@@ -689,21 +715,34 @@ async def get_steam_data(app_id: str):
     # Parse SteamCMD early so its metadata and assets are ready as fallbacks
     cmd_common = {}
     cmd_lib_assets = {}
-    clienticon_url = ""
     community_icon_url = ""
+    clienticon_ico_url = ""
+    clienticon_full_url = ""
     if not isinstance(cmd_res, Exception) and getattr(cmd_res, "status_code", 0) == 200:
         try:
-            cmd_data = cmd_res.json()
-            cmd_common = cmd_data.get("data", {}).get(str(app_id), {}).get("common", {})
-            cmd_lib_assets = cmd_common.get("library_assets_full", {})
-            cicon_hash = cmd_common.get("clienticon")
-            if cicon_hash:
-                clienticon_url = f"https://shared.fastly.steamstatic.com/community_assets/images/apps/{app_id}/{cicon_hash}.ico"
-            comm_hash = cmd_common.get("icon")
-            if comm_hash:
-                community_icon_url = f"https://shared.fastly.steamstatic.com/community_assets/images/apps/{app_id}/{comm_hash}.jpg"
+            cmd_common, cmd_lib_assets, community_icon_url, clienticon_ico_url, clienticon_full_url = parse_steamcmd_common(cmd_res.json(), app_id)
         except Exception as e:
             logger.warning(f"Failed to parse steamcmd data: {e}")
+
+    # SteamCMD 数据（库图 / 官方 Logo / 社区小图标哈希）也是并发抓取的一部分，同样会被限流：
+    # 缺失时单独串行重试一次，避免官方资产整批缺失后静默退回低质量小图。
+    if not cmd_common:
+        try:
+            await asyncio.sleep(0.5)
+            rc_res = await client.get(f"https://api.steamcmd.net/v1/info/{app_id}", headers=headers, timeout=10.0)
+            if getattr(rc_res, "status_code", 0) == 200:
+                rc_common, rc_assets, rc_icon, rc_ico, rc_full = parse_steamcmd_common(rc_res.json(), app_id)
+                if rc_common:
+                    cmd_common, cmd_lib_assets = rc_common, rc_assets
+                    community_icon_url = rc_icon or community_icon_url
+                    # 重试成功时桌面图标链接也要一并采纳，否则被限流的那次会让桌面图标凭空消失
+                    clienticon_ico_url = rc_ico or clienticon_ico_url
+                    clienticon_full_url = rc_full or clienticon_full_url
+                    logger.info(f"Retried steamcmd info for {app_id}: ok")
+                else:
+                    logger.warning(f"Retried steamcmd info for {app_id}: still empty")
+        except Exception as e:
+            logger.warning(f"Retry steamcmd info failed for {app_id}: {type(e).__name__} {e}")
 
     cn_data = {}
     if not isinstance(cn_res, Exception) and getattr(cn_res, "status_code", 0) == 200:
@@ -907,13 +946,9 @@ async def get_steam_data(app_id: str):
     elif isinstance(cmd_header_raw, str) and cmd_header_raw:
         cmd_header = f"https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/{app_id}/{cmd_header_raw}"
 
-    # Fallback for community icon
+    # 社区小图标兜底（桌面图标 clienticon 的写入方式见 resolve_notion_page_icon 的四级兜底）
     if not community_icon_url:
         community_icon_url = f"https://cdn.cloudflare.steamstatic.com/steam/apps/{app_id}/capsule_sm_120.jpg"
-
-    # If clienticon couldn't be retrieved via SteamCMD API, fallback to community icon
-    if not clienticon_url:
-        clienticon_url = community_icon_url
 
     # Verify official logo (高清透明Logo)
     official_logo_url = cmd_logo
@@ -955,7 +990,10 @@ async def get_steam_data(app_id: str):
         "library_hero": library_hero,
         "library_grid": library_grid,
         "official_logo": official_logo_url,
-        "clienticon": clienticon_url,
+        # 桌面图标：.ico 供画廊预览（浏览器能显示），写入 Notion 时由后端抽取内嵌 PNG 后上传，
+        # .ico 链接本身绝不会写进 Notion（Notion 渲染 .ico 会显示空白）；_full.jpg 为同期兜底。
+        "clienticon": clienticon_ico_url,
+        "clienticon_full": clienticon_full_url,
         "icon": community_icon_url
     }
 
@@ -1194,11 +1232,11 @@ async def create_notion_page(request: Request):
     images = data.get("images", {})
     steam_images = game.get("steam_images", {})
     
-    # 桌面图标 = clienticon (优先) / official_logo / icon, 库横幅 = pagecover (hero), Steam封面 = 封面 (grid)
+    # 库横幅 = pagecover (hero)，Steam封面 = 封面 (grid)
+    # 页面图标不再在这里决定，改由 resolve_notion_page_icon() 按四级兜底解析（含桌面图标转 PNG 上传）
     # sanitize_image_url：去掉链接末尾的 ?t=xxxxxx 缓存参数（带该参数在 Notion 中偶发不显示）
     grid_img = sanitize_image_url(images.get("grid") or steam_images.get("header") or game.get("header_image") or steam_images.get("library_grid") or "")
     hero_img = sanitize_image_url(images.get("hero") or steam_images.get("library_hero") or "")
-    icon_img = sanitize_image_url(images.get("icon") or steam_images.get("clienticon") or steam_images.get("official_logo") or steam_images.get("icon") or "")
     
     mapping = config.get("field_mapping", {})
     mapping = await ensure_field_mapping_healthy(mapping, db_id, token)
@@ -1284,24 +1322,29 @@ async def create_notion_page(request: Request):
         else:
             logger.warning(f"Tags were not sent: mapping.tags.name='{tag_prop_name}', enabled={mapping.get('tags', {}).get('enabled')}")
 
+    # 页面图标：四级兜底（桌面图标 .ico → 抽取内嵌 PNG 上传 → _full.jpg → 官方 Logo → 社区小图标）
+    client = get_client()
+    icon_obj = None
+    if config.get("use_icon_as_page_icon"):
+        icon_obj = await resolve_notion_page_icon(client, token, images.get("icon") or "", steam_images, allow_default=True)
+
     page_data = {
         "parent": {"database_id": db_id},
         "properties": properties
     }
-    
+
     if config.get("use_hero_as_cover") and hero_img:
         page_data["cover"] = {"type": "external", "external": {"url": str(hero_img)[:2000]}}
-        
-    if config.get("use_icon_as_page_icon") and icon_img:
-        page_data["icon"] = {"type": "external", "external": {"url": str(icon_img)[:2000]}}
-        
+
+    if icon_obj:
+        page_data["icon"] = icon_obj
+
     headers = {
         "Authorization": f"Bearer {token}",
         "Notion-Version": "2022-06-28",
         "Content-Type": "application/json"
     }
-    
-    client = get_client()
+
     try:
         res = await client.post("https://api.notion.com/v1/pages", headers=headers, json=page_data, timeout=12.0)
         if res.status_code not in (200, 201):
@@ -1398,6 +1441,145 @@ def sanitize_image_url(url: str) -> str:
     if url and not IMAGE_URL_EXT_RE.search(url):
         logger.warning(f"图片链接不以常见图片扩展名结尾，原样保留（未改写）: {url[:160]}")
     return url
+
+# ---------------------------------------------------------------- 页面图标（四级兜底）
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+
+def is_ico_url(url: str) -> bool:
+    """判断链接是否为 .ico（Notion 渲染 .ico 会显示空白，写入前必须转成 PNG）。"""
+    return bool(url) and url.split("?", 1)[0].split("#", 1)[0].strip().lower().endswith(".ico")
+
+def extract_png_from_ico(ico_bytes: bytes) -> Optional[bytes]:
+    """从 ICO 容器中取出"面积最大"的图层，仅当该图层本身就是内嵌 PNG 时返回其字节。
+
+    实测主流游戏的 clienticon(.ico) 最大图层就是一张 256×256 的 PNG（带真透明通道）；
+    部分老游戏只有 BMP 图层，此时返回 None，交由调用方走后续兜底（不引入图像库）。
+    """
+    if not ico_bytes or len(ico_bytes) < 22 or ico_bytes[:4] != b"\x00\x00\x01\x00":
+        return None
+    try:
+        count = struct.unpack_from("<H", ico_bytes, 4)[0]
+    except struct.error:
+        return None
+    best = None  # (像素面积, PNG 字节)
+    for i in range(count):
+        off = 6 + i * 16
+        if off + 16 > len(ico_bytes):
+            break
+        try:
+            w, h, _colors, _res, _planes, _bpp, size, offset = struct.unpack_from("<BBBBHHII", ico_bytes, off)
+        except struct.error:
+            break
+        if size <= 0 or offset + size > len(ico_bytes):
+            continue
+        payload = ico_bytes[offset:offset + size]
+        if payload[:8] != PNG_SIGNATURE:
+            continue
+        area = (w or 256) * (h or 256)
+        if best is None or area > best[0]:
+            best = (area, payload)
+    return best[1] if best else None
+
+async def upload_png_to_notion(client: httpx.AsyncClient, token: str, png_bytes: bytes, filename: str) -> Optional[str]:
+    """把 PNG 字节上传到 Notion（File Upload API：申请 → 发送），成功返回 file_upload id。"""
+    headers = {"Authorization": f"Bearer {token}", "Notion-Version": "2022-06-28"}
+    try:
+        res = await client.post(
+            "https://api.notion.com/v1/file_uploads",
+            headers=headers,
+            json={"filename": filename, "content_type": "image/png"},
+            timeout=12.0
+        )
+        if res.status_code not in (200, 201):
+            logger.warning(f"Notion file_upload 申请失败 {res.status_code}: {res.text[:200]}")
+            return None
+        info = res.json() or {}
+        upload_url, upload_id = info.get("upload_url"), info.get("id")
+        if not upload_url or not upload_id:
+            logger.warning(f"Notion file_upload 返回缺少字段: {str(info)[:200]}")
+            return None
+        # multipart 上传不能带 Content-Type: application/json（boundary 由 httpx 生成）
+        sent = await client.post(
+            upload_url,
+            headers=headers,
+            files={"file": (filename, png_bytes, "image/png")},
+            timeout=30.0
+        )
+        if sent.status_code not in (200, 201) or (sent.json() or {}).get("status") != "uploaded":
+            logger.warning(f"Notion file_upload 发送失败 {sent.status_code}: {sent.text[:200]}")
+            return None
+        return upload_id
+    except Exception as e:
+        logger.warning(f"Notion 图标上传异常: {type(e).__name__} {e}")
+        return None
+
+async def resolve_notion_page_icon(client: httpx.AsyncClient, token: str, selected_url: str,
+                                   steam_images: dict, allow_default: bool) -> Optional[dict]:
+    """决定写入 Notion 的页面图标对象，按四级兜底：
+
+      ① 桌面图标 .ico → 抽取内嵌 256×256 PNG 上传 Notion（真透明，渲染稳定）
+      ② 桌面图标 _full.jpg（184×184，实测仅约一半游戏存在，写入前必须确认可用，避免破图）
+      ③ 官方高清透明 Logo（PNG）
+      ④ 社区小图标（jpg）
+
+    用户若明确选择了非 .ico 的图片（例如 SteamGridDB 图标），直接原样使用。
+    返回 None 表示"不改动图标"（更新流程中用户主动取消选中的情形）。
+    """
+    sel = (selected_url or "").strip()
+    if sel and not is_ico_url(sel):
+        return {"type": "external", "external": {"url": sel[:2000]}}
+    if not sel and not allow_default:
+        return None
+
+    steam_images = steam_images or {}
+
+    # ① .ico 内嵌 PNG → 上传 Notion
+    ico_url = (steam_images.get("clienticon") or "").strip()
+    if ico_url:
+        png_bytes = None
+        try:
+            res = await client.get(ico_url, timeout=12.0)
+            if res.status_code == 200:
+                png_bytes = extract_png_from_ico(res.content)
+                if not png_bytes:
+                    logger.info("该游戏的桌面图标 .ico 无内嵌 PNG 图层（可能仅 BMP 图层），降级到后续兜底")
+            else:
+                logger.warning(f"下载桌面图标 .ico 失败：HTTP {res.status_code}")
+        except Exception as e:
+            logger.warning(f"下载桌面图标 .ico 异常：{type(e).__name__} {e}")
+        if png_bytes:
+            m = re.search(r"/apps/(\d+)/", ico_url)
+            filename = f"steam_icon_{m.group(1) if m else 'unknown'}.png"
+            upload_id = await upload_png_to_notion(client, token, png_bytes, filename)
+            if upload_id:
+                logger.info(f"页面图标：桌面图标已转为 PNG 并上传 Notion（{len(png_bytes)} 字节）")
+                return {"type": "file_upload", "file_upload": {"id": upload_id}}
+            logger.warning("桌面图标上传 Notion 失败，降级到后续兜底图片")
+
+    # ② 桌面图标 _full.jpg（需确认存在）
+    full_url = (steam_images.get("clienticon_full") or "").strip()
+    if full_url:
+        try:
+            probe = await client.get(full_url, timeout=8.0)
+            if probe.status_code == 200 and probe.content:
+                logger.info("页面图标：使用桌面图标 _full.jpg")
+                return {"type": "external", "external": {"url": full_url[:2000]}}
+        except Exception as e:
+            logger.warning(f"检查桌面图标 _full.jpg 异常：{type(e).__name__} {e}")
+
+    # ③ 官方高清透明 Logo
+    logo_url = (steam_images.get("official_logo") or "").strip()
+    if logo_url:
+        logger.info("页面图标：使用官方高清透明 Logo")
+        return {"type": "external", "external": {"url": logo_url[:2000]}}
+
+    # ④ 社区小图标
+    comm_url = (steam_images.get("icon") or "").strip()
+    if comm_url:
+        logger.info("页面图标：使用社区小图标")
+        return {"type": "external", "external": {"url": comm_url[:2000]}}
+
+    return None
 
 def _notion_match_condition(prop_name: str, prop_type: Optional[str], value: str, url_variants: bool = False) -> Optional[dict]:
     """按 Notion 属性的真实类型构造等值匹配条件。
@@ -1588,7 +1770,7 @@ async def update_notion_page(request: Request):
 
     grid_img = sanitize_image_url(resolve_selected_image("grid", steam_images.get("header") or "", game.get("header_image") or "", steam_images.get("library_grid") or ""))
     hero_img = sanitize_image_url(resolve_selected_image("hero", steam_images.get("library_hero") or ""))
-    icon_img = sanitize_image_url(resolve_selected_image("icon", steam_images.get("clienticon") or "", steam_images.get("official_logo") or "", steam_images.get("icon") or ""))
+    # 页面图标见下方 resolve_notion_page_icon()：需区分"用户取消选中"与"未提交"，故不在此处取默认值
 
     db_id = config.get("database_id")
     mapping = config.get("field_mapping", {})
@@ -1683,6 +1865,15 @@ async def update_notion_page(request: Request):
             if src_key == "cover_grid" and grid_img and name and ptype == "files":
                 properties[name] = {"files": [{"type": "external", "name": "cover", "external": {"url": str(grid_img)[:2000]}}]}
 
+    # 页面图标：四级兜底。注意 "icon" 键存在且为空串 = 用户主动取消选中 → 不改动图标（保留 Notion 原值）
+    client = get_client()
+    icon_obj = None
+    if config.get("use_icon_as_page_icon"):
+        icon_obj = await resolve_notion_page_icon(
+            client, token, images.get("icon") or "", steam_images,
+            allow_default=("icon" not in images)
+        )
+
     page_patch = {}
     if properties:
         page_patch["properties"] = properties
@@ -1690,8 +1881,8 @@ async def update_notion_page(request: Request):
     if config.get("use_hero_as_cover") and hero_img:
         page_patch["cover"] = {"type": "external", "external": {"url": str(hero_img)[:2000]}}
 
-    if config.get("use_icon_as_page_icon") and icon_img:
-        page_patch["icon"] = {"type": "external", "external": {"url": str(icon_img)[:2000]}}
+    if icon_obj:
+        page_patch["icon"] = icon_obj
 
     if not page_patch:
         return JSONResponse(status_code=400, content={"status": "error", "message": "没有需要更新的字段或图片"})
@@ -1702,7 +1893,6 @@ async def update_notion_page(request: Request):
         "Content-Type": "application/json"
     }
 
-    client = get_client()
     try:
         res = await client.patch(f"https://api.notion.com/v1/pages/{page_id}", headers=headers, json=page_patch, timeout=12.0)
         if res.status_code not in (200, 201):
