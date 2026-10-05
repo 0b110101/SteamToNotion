@@ -1513,50 +1513,87 @@ async def upload_png_to_notion(client: httpx.AsyncClient, token: str, png_bytes:
         logger.warning(f"Notion 图标上传异常: {type(e).__name__} {e}")
         return None
 
+async def _fetch_ico_png(client: httpx.AsyncClient, ico_url: str) -> Optional[bytes]:
+    """下载指定 .ico 并抽取其中"面积最大"的内嵌 PNG 图层（抽不出返回 None）。"""
+    try:
+        res = await client.get(ico_url, timeout=12.0)
+        if res.status_code != 200:
+            logger.warning(f"下载 .ico 失败：HTTP {res.status_code} {ico_url[:120]}")
+            return None
+        png_bytes = extract_png_from_ico(res.content)
+        if not png_bytes:
+            logger.info(f"该 .ico 无内嵌 PNG 图层（可能仅 BMP 图层）：{ico_url[:120]}")
+        return png_bytes
+    except Exception as e:
+        logger.warning(f"下载 .ico 异常：{type(e).__name__} {e}")
+        return None
+
+def _sgdb_icon_png_url(ico_url: str) -> str:
+    """SteamGridDB 的图标同时提供同款 PNG（实测 256×256 真 PNG，可直接外链写入 Notion，无需上传）：
+    https://cdn2.steamgriddb.com/icon/<hash>.ico → https://cdn2.steamgriddb.com/icon/<hash>/32/256x256.png
+    """
+    m = re.match(r"^https?://cdn2\.steamgriddb\.com/icon/([0-9a-f]{32})\.ico$", (ico_url or "").strip(), re.IGNORECASE)
+    return f"https://cdn2.steamgriddb.com/icon/{m.group(1)}/32/256x256.png" if m else ""
+
+def _icon_upload_filename(url: str) -> str:
+    m = re.search(r"/apps/(\d+)/", url) or re.search(r"/icon/([0-9a-f]{32})", url, re.IGNORECASE)
+    return f"steam_icon_{m.group(1) if m else 'unknown'}.png"
+
 async def resolve_notion_page_icon(client: httpx.AsyncClient, token: str, selected_url: str,
                                    steam_images: dict, allow_default: bool) -> Optional[dict]:
-    """决定写入 Notion 的页面图标对象，按四级兜底：
+    """决定写入 Notion 的页面图标对象。规则（优先级从高到低）：
 
-      ① 桌面图标 .ico → 抽取内嵌 256×256 PNG 上传 Notion（真透明，渲染稳定）
-      ② 桌面图标 _full.jpg（184×184，实测仅约一半游戏存在，写入前必须确认可用，避免破图）
-      ③ 官方高清透明 Logo（PNG）
-      ④ 社区小图标（jpg）
+      1. 用户明确选了非 .ico 的图片（SteamGridDB 的 PNG、官方 Logo 等）→ **原样使用**；
+      2. 用户选了 .ico（可能是 Steam 桌面图标，也可能是 SteamGridDB 的 .ico）
+         → 先尝试把**用户选中的那一张**抽取内嵌 256×256 PNG 上传 Notion（真透明、渲染稳定）；
+         → 抽不出/上传失败则尝试 SGDB 同款 PNG 外链；两者都失败才退回默认链；
+      3. 未选图标且允许默认（新建流程）→ 默认链：
+         ① Steam 桌面图标 .ico → 转 PNG 上传；② 桌面图标 _full.jpg；③ 官方高清透明 Logo；④ 社区小图标。
 
-    用户若明确选择了非 .ico 的图片（例如 SteamGridDB 图标），直接原样使用。
     返回 None 表示"不改动图标"（更新流程中用户主动取消选中的情形）。
     """
     sel = (selected_url or "").strip()
+    steam_images = steam_images or {}
+
+    # 1) 非 .ico：用户选什么就用什么（这是最优先的规则）
     if sel and not is_ico_url(sel):
+        logger.info(f"页面图标：使用所选图片 {sel[:140]}")
         return {"type": "external", "external": {"url": sel[:2000]}}
+
+    # 2) 取消选中（更新流程）→ 不改动图标
     if not sel and not allow_default:
         return None
 
-    steam_images = steam_images or {}
+    steam_ico = (steam_images.get("clienticon") or "").strip()
+    # 用户选了 .ico 就转"用户选的那张"；只有未选择时才用 Steam 桌面图标
+    target_ico = sel or steam_ico
+    if sel:
+        logger.info(f"页面图标：所选图标是 .ico（{sel[:140]}），尝试转为 PNG 上传 Notion")
 
-    # ① .ico 内嵌 PNG → 上传 Notion
-    ico_url = (steam_images.get("clienticon") or "").strip()
-    if ico_url:
-        png_bytes = None
-        try:
-            res = await client.get(ico_url, timeout=12.0)
-            if res.status_code == 200:
-                png_bytes = extract_png_from_ico(res.content)
-                if not png_bytes:
-                    logger.info("该游戏的桌面图标 .ico 无内嵌 PNG 图层（可能仅 BMP 图层），降级到后续兜底")
-            else:
-                logger.warning(f"下载桌面图标 .ico 失败：HTTP {res.status_code}")
-        except Exception as e:
-            logger.warning(f"下载桌面图标 .ico 异常：{type(e).__name__} {e}")
+    if target_ico:
+        png_bytes = await _fetch_ico_png(client, target_ico)
         if png_bytes:
-            m = re.search(r"/apps/(\d+)/", ico_url)
-            filename = f"steam_icon_{m.group(1) if m else 'unknown'}.png"
-            upload_id = await upload_png_to_notion(client, token, png_bytes, filename)
+            upload_id = await upload_png_to_notion(client, token, png_bytes, _icon_upload_filename(target_ico))
             if upload_id:
-                logger.info(f"页面图标：桌面图标已转为 PNG 并上传 Notion（{len(png_bytes)} 字节）")
+                logger.info(f"页面图标：.ico 已转为 PNG 并上传 Notion（{len(png_bytes)} 字节）")
                 return {"type": "file_upload", "file_upload": {"id": upload_id}}
-            logger.warning("桌面图标上传 Notion 失败，降级到后续兜底图片")
+            logger.warning("页面图标：.ico 上传 Notion 失败，尝试其它可显示的同款图片")
 
-    # ② 桌面图标 _full.jpg（需确认存在）
+        # 第三方 .ico（如 SteamGridDB）：尝试其自带的同款 PNG 外链
+        alt_png = _sgdb_icon_png_url(target_ico)
+        if alt_png:
+            try:
+                probe = await client.get(alt_png, timeout=8.0)
+                if probe.status_code == 200 and probe.content[:8] == PNG_SIGNATURE:
+                    logger.info("页面图标：使用 SteamGridDB 同款 PNG（外链）")
+                    return {"type": "external", "external": {"url": alt_png[:2000]}}
+            except Exception as e:
+                logger.warning(f"页面图标：检查 SGDB 同款 PNG 异常 {type(e).__name__} {e}")
+
+        if sel and sel != steam_ico:
+            logger.warning(f"页面图标：所选 .ico 无法用于 Notion（会渲染成空白），退回默认图标链：{sel[:140]}")
+
+    # 3) 默认链：② 桌面图标 _full.jpg（需确认存在）
     full_url = (steam_images.get("clienticon_full") or "").strip()
     if full_url:
         try:
